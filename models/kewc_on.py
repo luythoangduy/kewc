@@ -45,15 +45,21 @@ class KEwcOn(ContinualModel):
         self.forward_handles = []
         self.backward_handles = []
         
-        # Temporary storage for collecting statistics
-        self.activations = {}
-        self.gradients = {}
+        # Memory-efficient streaming computation
+        self.A_running = {}  # Running sum for A factors
+        self.G_running = {}  # Running sum for G factors
+        self.sample_count = 0
         
         self.cpr = CPR()
         self.beta = 0.0
         self.CPRon = False
         
         self.damping = args.damping if hasattr(args, 'damping') else 1e-3
+        
+        # Memory optimization settings
+        self.max_samples_per_batch = getattr(args, 'kfac_max_samples', 32)
+        self.use_cpu_storage = getattr(args, 'kfac_cpu_storage', True)
+        self.conv_sample_ratio = getattr(args, 'conv_sample_ratio', 0.1)  # Sample 10% of conv patches
 
     def _get_layer_name(self, module, name):
         """Generate unique layer name for indexing"""
@@ -73,74 +79,73 @@ class KEwcOn(ContinualModel):
         return batch_size, in_channels, kernel_h, kernel_w, h_out, w_out
 
     def _register_hooks(self):
-        """Register forward and backward hooks for collecting activations and gradients"""
-        def make_forward_hook(layer_name):
-            def forward_hook(module, input, output):
-                if isinstance(module, nn.Linear):
-                    # For linear layers, store input activations
+        """Register memory-efficient hooks for streaming computation"""
+        def make_forward_hook(layer_name, module):
+            def forward_hook(module_inner, input, output):
+                if isinstance(module_inner, nn.Linear):
+                    # For linear layers, compute A factor incrementally
                     act = input[0].detach()
                     if act.dim() > 2:
                         act = act.view(act.size(0), -1)
                     
-                    # Add bias column for bias terms
+                    # Add bias column
                     ones = torch.ones(act.size(0), 1, device=act.device)
                     act_with_bias = torch.cat([act, ones], dim=1)
                     
-                    if layer_name not in self.activations:
-                        self.activations[layer_name] = []
-                    self.activations[layer_name].append(act_with_bias)
-                
-                elif isinstance(module, nn.Conv2d):
-                    # For conv layers, use unfold to convert to matrix form
-                    act = input[0].detach()  # [batch, in_channels, H, W]
+                    # Compute A factor incrementally to save memory
+                    self._update_A_factor_streaming(layer_name, act_with_bias)
                     
-                    # Use unfold to extract patches
-                    # patches: [batch, in_channels * kernel_h * kernel_w, num_patches]
+                elif isinstance(module_inner, nn.Conv2d):
+                    # Memory-efficient conv processing with sampling
+                    act = input[0].detach()
+                    
+                    # Sample patches to reduce memory usage
                     patches = F.unfold(
                         act,
-                        kernel_size=module.kernel_size,
-                        padding=module.padding,
-                        stride=module.stride,
-                        dilation=module.dilation
+                        kernel_size=module_inner.kernel_size,
+                        padding=module_inner.padding,
+                        stride=module_inner.stride,
+                        dilation=module_inner.dilation
                     )
                     
-                    # Reshape to [batch * num_patches, in_channels * kernel_h * kernel_w]
                     batch_size, patch_dim, num_patches = patches.shape
                     patches = patches.transpose(1, 2).contiguous().view(-1, patch_dim)
                     
-                    # Add bias column for bias terms
+                    # Sample patches to reduce memory
+                    if patches.size(0) > 1000:  # Only sample if too many patches
+                        n_samples = max(100, int(patches.size(0) * self.conv_sample_ratio))
+                        idx = torch.randperm(patches.size(0), device=patches.device)[:n_samples]
+                        patches = patches[idx]
+                    
+                    # Add bias column
                     ones = torch.ones(patches.size(0), 1, device=patches.device)
                     patches_with_bias = torch.cat([patches, ones], dim=1)
                     
-                    if layer_name not in self.activations:
-                        self.activations[layer_name] = []
-                    self.activations[layer_name].append(patches_with_bias)
+                    self._update_A_factor_streaming(layer_name, patches_with_bias)
                     
             return forward_hook
 
-        def make_backward_hook(layer_name):
-            def backward_hook(module, grad_input, grad_output):
-                if isinstance(module, nn.Linear) and grad_output[0] is not None:
-                    # For linear layers, store output gradients
+        def make_backward_hook(layer_name, module):
+            def backward_hook(module_inner, grad_input, grad_output):
+                if isinstance(module_inner, nn.Linear) and grad_output[0] is not None:
                     grad = grad_output[0].detach()
                     if grad.dim() > 2:
                         grad = grad.view(grad.size(0), -1)
                     
-                    if layer_name not in self.gradients:
-                        self.gradients[layer_name] = []
-                    self.gradients[layer_name].append(grad)
-                
-                elif isinstance(module, nn.Conv2d) and grad_output[0] is not None:
-                    # For conv layers, flatten output gradients
-                    grad = grad_output[0].detach()  # [batch, out_channels, H_out, W_out]
+                    self._update_G_factor_streaming(layer_name, grad)
                     
-                    # Reshape to [batch * H_out * W_out, out_channels]
+                elif isinstance(module_inner, nn.Conv2d) and grad_output[0] is not None:
+                    grad = grad_output[0].detach()
                     batch_size, out_channels, h_out, w_out = grad.shape
                     grad = grad.permute(0, 2, 3, 1).contiguous().view(-1, out_channels)
                     
-                    if layer_name not in self.gradients:
-                        self.gradients[layer_name] = []
-                    self.gradients[layer_name].append(grad)
+                    # Sample gradients to reduce memory
+                    if grad.size(0) > 1000:
+                        n_samples = max(100, int(grad.size(0) * self.conv_sample_ratio))
+                        idx = torch.randperm(grad.size(0), device=grad.device)[:n_samples]
+                        grad = grad[idx]
+                    
+                    self._update_G_factor_streaming(layer_name, grad)
                     
             return backward_hook
 
@@ -149,8 +154,8 @@ class KEwcOn(ContinualModel):
             if isinstance(module, (nn.Linear, nn.Conv2d)):
                 layer_name = self._get_layer_name(module, name)
                 
-                fh = module.register_forward_hook(make_forward_hook(layer_name))
-                bh = module.register_full_backward_hook(make_backward_hook(layer_name))
+                fh = module.register_forward_hook(make_forward_hook(layer_name, module))
+                bh = module.register_full_backward_hook(make_backward_hook(layer_name, module))
                 
                 self.forward_handles.append(fh)
                 self.backward_handles.append(bh)
@@ -162,23 +167,47 @@ class KEwcOn(ContinualModel):
         self.forward_handles = []
         self.backward_handles = []
 
-    def _compute_kronecker_factors(self):
-        """Compute Kronecker factors A and G for each layer"""
+    def _update_A_factor_streaming(self, layer_name, activations):
+        """Update A factor incrementally to save memory"""
+        # Compute outer product incrementally
+        A_batch = torch.mm(activations.t(), activations)
+        
+        if layer_name not in self.A_running:
+            self.A_running[layer_name] = A_batch.cpu() if self.use_cpu_storage else A_batch
+        else:
+            if self.use_cpu_storage:
+                self.A_running[layer_name] += A_batch.cpu()
+            else:
+                self.A_running[layer_name] += A_batch
+    
+    def _update_G_factor_streaming(self, layer_name, gradients):
+        """Update G factor incrementally to save memory"""
+        # Compute outer product incrementally
+        G_batch = torch.mm(gradients.t(), gradients)
+        
+        if layer_name not in self.G_running:
+            self.G_running[layer_name] = G_batch.cpu() if self.use_cpu_storage else G_batch
+        else:
+            if self.use_cpu_storage:
+                self.G_running[layer_name] += G_batch.cpu()
+            else:
+                self.G_running[layer_name] += G_batch
+    
+    def _finalize_kronecker_factors(self):
+        """Finalize Kronecker factors from streaming computation"""
         new_A_factors = {}
         new_G_factors = {}
         
-        for layer_name in self.activations:
-            if layer_name in self.gradients:
-                # Concatenate all activations and gradients for this layer
-                all_activations = torch.cat(self.activations[layer_name], dim=0)
-                all_gradients = torch.cat(self.gradients[layer_name], dim=0)
+        for layer_name in self.A_running:
+            if layer_name in self.G_running:
+                # Normalize by sample count and add damping
+                A = self.A_running[layer_name] / self.sample_count
+                G = self.G_running[layer_name] / self.sample_count
                 
-                # Compute empirical covariance matrices
-                # A = E[aa^T] where a is activation
-                A = torch.mm(all_activations.t(), all_activations) / all_activations.size(0)
-                
-                # G = E[gg^T] where g is gradient  
-                G = torch.mm(all_gradients.t(), all_gradients) / all_gradients.size(0)
+                # Move back to GPU if stored on CPU
+                if self.use_cpu_storage:
+                    A = A.to(self.device)
+                    G = G.to(self.device)
                 
                 # Add damping for numerical stability
                 A.add_(torch.eye(A.size(0), device=A.device) * self.damping)
@@ -207,7 +236,7 @@ class KEwcOn(ContinualModel):
                     self.G_factors[layer_name] = new_G_factors[layer_name]
 
     def penalty(self):
-        """Compute K-EWC penalty using Kronecker-factored approximation"""
+        """Memory-efficient K-EWC penalty computation"""
         if self.checkpoint is None or not self.A_factors:
             return torch.tensor(0.0).to(self.device)
         
@@ -293,42 +322,68 @@ class KEwcOn(ContinualModel):
                 # Bước 2: (result_step1 @ delta_W) -> [(in+1), out] @ [out, (in+1)] = [(in+1), (in+1)]
                 temp = torch.mm(torch.mm(delta_W.t(), G), delta_W)
                 
-                # Bước 3: Element-wise product rồi sum, tương đương với Trace
-                penalty_layer = 0.5 * torch.sum(A * temp)
+                # Memory-efficient trace computation
+                # Move matrices to CPU if they're large to save GPU memory
+                if A.numel() > 10000 and self.use_cpu_storage:
+                    A_cpu = A.cpu()
+                    temp_cpu = temp.cpu()
+                    penalty_layer = 0.5 * torch.sum(A_cpu * temp_cpu)
+                    penalty_layer = penalty_layer.to(self.device)
+                else:
+                    penalty_layer = 0.5 * torch.sum(A * temp)
                 
                 total_penalty += penalty_layer
+                
+                # Clear intermediate tensors
+                del temp
+                if 'A_cpu' in locals():
+                    del A_cpu, temp_cpu
                 
         return total_penalty
 
     def end_task(self, dataset):
-        """End of task processing to compute and update Kronecker factors"""
-        # Clear previous collections
-        self.activations = {}
-        self.gradients = {}
+        """Memory-efficient end of task processing"""
+        # Initialize streaming computation
+        self.A_running = {}
+        self.G_running = {}
+        self.sample_count = 0
         
-        # Register hooks for data collection
+        # Register hooks for streaming data collection
         self._register_hooks()
         
-        # Collect activations and gradients over the dataset
+        # Process data in smaller batches to avoid memory issues
         self.net.eval()
         with torch.enable_grad():
             for j, data in enumerate(dataset.train_loader):
                 inputs, labels, _ = data
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 
-                for ex, lab in zip(inputs, labels):
+                # Process in smaller mini-batches if needed
+                batch_size = inputs.size(0)
+                mini_batch_size = min(self.max_samples_per_batch, batch_size)
+                
+                for i in range(0, batch_size, mini_batch_size):
+                    mini_inputs = inputs[i:i+mini_batch_size]
+                    mini_labels = labels[i:i+mini_batch_size]
+                    
                     self.opt.zero_grad()
-                    output = self.net(ex.unsqueeze(0))
+                    output = self.net(mini_inputs)
                     
-                    # Compute negative log-likelihood as in original EWC
-                    loss = -F.nll_loss(self.logsoft(output), lab.unsqueeze(0), reduction='none')
-                    exp_cond_prob = torch.mean(torch.exp(loss.detach().clone()))
-                    loss = torch.mean(loss) * exp_cond_prob
+                    # Compute loss for each sample
+                    for k, (ex_out, lab) in enumerate(zip(output, mini_labels)):
+                        loss = -F.nll_loss(self.logsoft(ex_out.unsqueeze(0)), lab.unsqueeze(0), reduction='none')
+                        exp_cond_prob = torch.mean(torch.exp(loss.detach().clone()))
+                        loss = torch.mean(loss) * exp_cond_prob
+                        loss.backward(retain_graph=k < len(mini_labels)-1)
+                        
+                        self.sample_count += 1
                     
-                    loss.backward()
+                    # Clear GPU cache periodically
+                    if j % 10 == 0:
+                        torch.cuda.empty_cache()
         
-        # Compute new Kronecker factors
-        new_A_factors, new_G_factors = self._compute_kronecker_factors()
+        # Finalize Kronecker factors from streaming computation
+        new_A_factors, new_G_factors = self._finalize_kronecker_factors()
         
         # Update factors with online averaging
         self._update_kronecker_factors(new_A_factors, new_G_factors)
@@ -336,13 +391,13 @@ class KEwcOn(ContinualModel):
         # Store checkpoint parameters
         self.checkpoint = self.net.get_params().data.clone()
         
-        # Clean up hooks
+        # Clean up
         self._cleanup_hooks()
+        self.A_running = {}
+        self.G_running = {}
         
-        # Clear temporary storage
-        self.activations = {}
-        self.gradients = {}
-        
+        # Final GPU cleanup
+        torch.cuda.empty_cache()
         self.net.train()
 
     def observe(self, inputs, labels, not_aug_inputs):
