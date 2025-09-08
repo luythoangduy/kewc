@@ -38,17 +38,21 @@ class KEwcOn(ContinualModel):
         self.checkpoint = None
         
         # Store Kronecker factors for each layer
-        self.A_factors = {}  # Activation covariance matrices
-        self.G_factors = {}  # Gradient covariance matrices
+        self.A_factors = {}  # Final activation covariance matrices
+        self.G_factors = {}  # Final gradient covariance matrices
+        
+        # Running factors for online updates
+        self.A_running = {}  # Running A factors with EMA
+        self.G_running = {}  # Running G factors with EMA
         
         # Hook handles for cleanup
         self.forward_handles = []
         self.backward_handles = []
         
-        # Memory-efficient streaming computation
-        self.A_running = {}  # Running sum for A factors
-        self.G_running = {}  # Running sum for G factors
-        self.sample_count = 0
+        # Online training state
+        self.training_steps = 0
+        self.ema_decay = getattr(args, 'kfac_ema_decay', 0.95)  # EMA decay rate
+        self.hooks_registered = False
         
         self.cpr = CPR()
         self.beta = 0.0
@@ -57,9 +61,8 @@ class KEwcOn(ContinualModel):
         self.damping = args.damping if hasattr(args, 'damping') else 1e-3
         
         # Memory optimization settings
-        self.max_samples_per_batch = getattr(args, 'kfac_max_samples', 32)
-        self.use_cpu_storage = getattr(args, 'kfac_cpu_storage', True)
         self.conv_sample_ratio = getattr(args, 'conv_sample_ratio', 0.1)  # Sample 10% of conv patches
+        self.update_freq = getattr(args, 'kfac_update_freq', 1)  # Update K-FAC every N steps
 
     def _get_layer_name(self, module, name):
         """Generate unique layer name for indexing"""
@@ -78,12 +81,18 @@ class KEwcOn(ContinualModel):
         
         return batch_size, in_channels, kernel_h, kernel_w, h_out, w_out
 
-    def _register_hooks(self):
-        """Register memory-efficient hooks for streaming computation"""
+    def _register_hooks_for_observe(self):
+        """Register hooks for online K-FAC updates during training"""
+        if self.hooks_registered:
+            return
+            
         def make_forward_hook(layer_name, module):
             def forward_hook(module_inner, input, output):
+                # Only update during training and at specified frequency
+                if not self.net.training or self.training_steps % self.update_freq != 0:
+                    return
+                    
                 if isinstance(module_inner, nn.Linear):
-                    # For linear layers, compute A factor incrementally
                     act = input[0].detach()
                     if act.dim() > 2:
                         act = act.view(act.size(0), -1)
@@ -92,14 +101,11 @@ class KEwcOn(ContinualModel):
                     ones = torch.ones(act.size(0), 1, device=act.device)
                     act_with_bias = torch.cat([act, ones], dim=1)
                     
-                    # Compute A factor incrementally to save memory
-                    self._update_A_factor_streaming(layer_name, act_with_bias)
+                    self._update_A_factor_online(layer_name, act_with_bias)
                     
                 elif isinstance(module_inner, nn.Conv2d):
-                    # Memory-efficient conv processing with sampling
                     act = input[0].detach()
                     
-                    # Sample patches to reduce memory usage
                     patches = F.unfold(
                         act,
                         kernel_size=module_inner.kernel_size,
@@ -112,7 +118,7 @@ class KEwcOn(ContinualModel):
                     patches = patches.transpose(1, 2).contiguous().view(-1, patch_dim)
                     
                     # Sample patches to reduce memory
-                    if patches.size(0) > 1000:  # Only sample if too many patches
+                    if patches.size(0) > 1000:
                         n_samples = max(100, int(patches.size(0) * self.conv_sample_ratio))
                         idx = torch.randperm(patches.size(0), device=patches.device)[:n_samples]
                         patches = patches[idx]
@@ -121,31 +127,35 @@ class KEwcOn(ContinualModel):
                     ones = torch.ones(patches.size(0), 1, device=patches.device)
                     patches_with_bias = torch.cat([patches, ones], dim=1)
                     
-                    self._update_A_factor_streaming(layer_name, patches_with_bias)
+                    self._update_A_factor_online(layer_name, patches_with_bias)
                     
             return forward_hook
 
         def make_backward_hook(layer_name, module):
             def backward_hook(module_inner, grad_input, grad_output):
+                # Only update during training and at specified frequency
+                if not self.net.training or self.training_steps % self.update_freq != 0:
+                    return
+                    
                 if isinstance(module_inner, nn.Linear) and grad_output[0] is not None:
                     grad = grad_output[0].detach()
                     if grad.dim() > 2:
                         grad = grad.view(grad.size(0), -1)
                     
-                    self._update_G_factor_streaming(layer_name, grad)
+                    self._update_G_factor_online(layer_name, grad)
                     
                 elif isinstance(module_inner, nn.Conv2d) and grad_output[0] is not None:
                     grad = grad_output[0].detach()
                     batch_size, out_channels, h_out, w_out = grad.shape
                     grad = grad.permute(0, 2, 3, 1).contiguous().view(-1, out_channels)
                     
-                    # Sample gradients to reduce memory
+                    # Sample gradients
                     if grad.size(0) > 1000:
                         n_samples = max(100, int(grad.size(0) * self.conv_sample_ratio))
                         idx = torch.randperm(grad.size(0), device=grad.device)[:n_samples]
                         grad = grad[idx]
                     
-                    self._update_G_factor_streaming(layer_name, grad)
+                    self._update_G_factor_online(layer_name, grad)
                     
             return backward_hook
 
@@ -159,6 +169,8 @@ class KEwcOn(ContinualModel):
                 
                 self.forward_handles.append(fh)
                 self.backward_handles.append(bh)
+        
+        self.hooks_registered = True
 
     def _cleanup_hooks(self):
         """Remove all registered hooks"""
@@ -167,56 +179,29 @@ class KEwcOn(ContinualModel):
         self.forward_handles = []
         self.backward_handles = []
 
-    def _update_A_factor_streaming(self, layer_name, activations):
-        """Update A factor incrementally to save memory"""
-        # Compute outer product incrementally
-        A_batch = torch.mm(activations.t(), activations)
+    def _update_A_factor_online(self, layer_name, activations):
+        """Update A factor using Exponential Moving Average during training"""
+        # Compute batch covariance
+        A_batch = torch.mm(activations.t(), activations) / activations.size(0)
         
         if layer_name not in self.A_running:
-            self.A_running[layer_name] = A_batch.cpu() if self.use_cpu_storage else A_batch
+            self.A_running[layer_name] = A_batch
         else:
-            if self.use_cpu_storage:
-                self.A_running[layer_name] += A_batch.cpu()
-            else:
-                self.A_running[layer_name] += A_batch
+            # EMA update: A_new = decay * A_old + (1 - decay) * A_batch
+            self.A_running[layer_name] = (self.ema_decay * self.A_running[layer_name] + 
+                                        (1 - self.ema_decay) * A_batch)
     
-    def _update_G_factor_streaming(self, layer_name, gradients):
-        """Update G factor incrementally to save memory"""
-        # Compute outer product incrementally
-        G_batch = torch.mm(gradients.t(), gradients)
+    def _update_G_factor_online(self, layer_name, gradients):
+        """Update G factor using Exponential Moving Average during training"""
+        # Compute batch covariance
+        G_batch = torch.mm(gradients.t(), gradients) / gradients.size(0)
         
         if layer_name not in self.G_running:
-            self.G_running[layer_name] = G_batch.cpu() if self.use_cpu_storage else G_batch
+            self.G_running[layer_name] = G_batch
         else:
-            if self.use_cpu_storage:
-                self.G_running[layer_name] += G_batch.cpu()
-            else:
-                self.G_running[layer_name] += G_batch
-    
-    def _finalize_kronecker_factors(self):
-        """Finalize Kronecker factors from streaming computation"""
-        new_A_factors = {}
-        new_G_factors = {}
-        
-        for layer_name in self.A_running:
-            if layer_name in self.G_running:
-                # Normalize by sample count and add damping
-                A = self.A_running[layer_name] / self.sample_count
-                G = self.G_running[layer_name] / self.sample_count
-                
-                # Move back to GPU if stored on CPU
-                if self.use_cpu_storage:
-                    A = A.to(self.device)
-                    G = G.to(self.device)
-                
-                # Add damping for numerical stability
-                A.add_(torch.eye(A.size(0), device=A.device) * self.damping)
-                G.add_(torch.eye(G.size(0), device=G.device) * self.damping)
-                
-                new_A_factors[layer_name] = A
-                new_G_factors[layer_name] = G
-        
-        return new_A_factors, new_G_factors
+            # EMA update: G_new = decay * G_old + (1 - decay) * G_batch
+            self.G_running[layer_name] = (self.ema_decay * self.G_running[layer_name] + 
+                                        (1 - self.ema_decay) * G_batch)
 
     def _update_kronecker_factors(self, new_A_factors, new_G_factors):
         """Update Kronecker factors with exponential moving average"""
@@ -242,176 +227,143 @@ class KEwcOn(ContinualModel):
         
         total_penalty = torch.tensor(0.0).to(self.device)
         
-        # Get current parameters organized by layer
-        current_params = {}
-        checkpoint_params = {}
+        # Simplified parameter extraction using EWC_ON style
+        current_params = self.net.get_params()
+        checkpoint_params = self.checkpoint
+        
+        # Organize parameters by layers for K-FAC computation
+        layer_params = {}
+        layer_checkpoint_params = {}
         
         param_idx = 0
         for name, module in self.net.named_modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 layer_name = self._get_layer_name(module, name)
                 
-                # Get weight and bias parameters
+                # Get parameter sizes
                 weight_size = module.weight.numel()
                 bias_size = module.bias.numel() if module.bias is not None else 0
                 total_size = weight_size + bias_size
                 
-                # Extract current parameters
-                current_layer_params_flat = self.net.get_params()[param_idx:param_idx + total_size]
-                checkpoint_layer_params_flat = self.checkpoint[param_idx:param_idx + total_size]
-                
-                # Reshape to [out_features, in_features + 1] (including bias)
-                if module.bias is not None:
-                    current_W = current_layer_params_flat[:weight_size].view(module.out_features, module.in_features)
-                    current_b = current_layer_params_flat[weight_size:].view(module.out_features, 1)
-                    current_params[layer_name] = torch.cat([current_W, current_b], dim=1)
-                    
-                    checkpoint_W = checkpoint_layer_params_flat[:weight_size].view(module.out_features, module.in_features)
-                    checkpoint_b = checkpoint_layer_params_flat[weight_size:].view(module.out_features, 1)
-                    checkpoint_params[layer_name] = torch.cat([checkpoint_W, checkpoint_b], dim=1)
-                else:
-                    current_params[layer_name] = current_layer_params_flat.view(module.out_features, module.in_features)
-                    checkpoint_params[layer_name] = checkpoint_layer_params_flat.view(module.out_features, module.in_features)
-                
-                param_idx += total_size
-            
-            elif isinstance(module, nn.Conv2d):
-                layer_name = self._get_layer_name(module, name)
-                
-                # Get weight and bias parameters
-                weight_size = module.weight.numel()
-                bias_size = module.bias.numel() if module.bias is not None else 0
-                total_size = weight_size + bias_size
-                
-                # Extract current parameters
-                current_layer_params_flat = self.net.get_params()[param_idx:param_idx + total_size]
-                checkpoint_layer_params_flat = self.checkpoint[param_idx:param_idx + total_size]
-                
-                # Reshape conv weights from 4D to 2D matrix
-                # [out_channels, in_channels, kernel_h, kernel_w] -> [out_channels, in_channels * kernel_h * kernel_w]
-                out_channels, in_channels, kernel_h, kernel_w = module.weight.shape
-                flat_weight_dim = in_channels * kernel_h * kernel_w
-                
-                if module.bias is not None:
-                    current_W = current_layer_params_flat[:weight_size].view(out_channels, flat_weight_dim)
-                    current_b = current_layer_params_flat[weight_size:].view(out_channels, 1)
-                    current_params[layer_name] = torch.cat([current_W, current_b], dim=1)
-                    
-                    checkpoint_W = checkpoint_layer_params_flat[:weight_size].view(out_channels, flat_weight_dim)
-                    checkpoint_b = checkpoint_layer_params_flat[weight_size:].view(out_channels, 1)
-                    checkpoint_params[layer_name] = torch.cat([checkpoint_W, checkpoint_b], dim=1)
-                else:
-                    current_params[layer_name] = current_layer_params_flat.view(out_channels, flat_weight_dim)
-                    checkpoint_params[layer_name] = checkpoint_layer_params_flat.view(out_channels, flat_weight_dim)
+                # Extract parameters for this layer
+                layer_params[layer_name] = current_params[param_idx:param_idx + total_size]
+                layer_checkpoint_params[layer_name] = checkpoint_params[param_idx:param_idx + total_size]
                 
                 param_idx += total_size
         
-        # Compute penalty for each layer
-        for layer_name in current_params:
+        # Compute K-FAC penalty for each layer
+        for layer_name in layer_params:
             if layer_name in self.A_factors and layer_name in self.G_factors:
-                delta_W = current_params[layer_name] - checkpoint_params[layer_name]
+                # Get parameter difference
+                delta_params = layer_params[layer_name] - layer_checkpoint_params[layer_name]
                 
-                A = self.A_factors[layer_name]
-                G = self.G_factors[layer_name]
+                # Get corresponding module to reshape parameters correctly
+                module = None
+                for name, mod in self.net.named_modules():
+                    if self._get_layer_name(mod, name) == layer_name:
+                        module = mod
+                        break
                 
-                # **SỬA LỖI TÍNH TOÁN**
-                # Công thức đúng: Tr(G * delta_W.T * A * delta_W)
-                # Cách tính hiệu quả: sum((delta_W.T @ G @ delta_W) * A)
-                
-                # Bước 1: (delta_W.T @ G) -> [(in+1), out] @ [out, out] = [(in+1), out]
-                # Bước 2: (result_step1 @ delta_W) -> [(in+1), out] @ [out, (in+1)] = [(in+1), (in+1)]
-                temp = torch.mm(torch.mm(delta_W.t(), G), delta_W)
-                
-                # Memory-efficient trace computation
-                # Move matrices to CPU if they're large to save GPU memory
-                if A.numel() > 10000 and self.use_cpu_storage:
-                    A_cpu = A.cpu()
-                    temp_cpu = temp.cpu()
-                    penalty_layer = 0.5 * torch.sum(A_cpu * temp_cpu)
-                    penalty_layer = penalty_layer.to(self.device)
-                else:
+                if module is not None:
+                    # Reshape parameters back to weight matrix form for K-FAC computation
+                    if isinstance(module, nn.Linear):
+                        weight_size = module.weight.numel()
+                        if module.bias is not None:
+                            delta_W = delta_params[:weight_size].view(module.out_features, module.in_features)
+                            delta_b = delta_params[weight_size:].view(module.out_features, 1)
+                            delta_W_full = torch.cat([delta_W, delta_b], dim=1)
+                        else:
+                            delta_W_full = delta_params.view(module.out_features, module.in_features)
+                    
+                    elif isinstance(module, nn.Conv2d):
+                        weight_size = module.weight.numel()
+                        out_channels, in_channels, kernel_h, kernel_w = module.weight.shape
+                        flat_weight_dim = in_channels * kernel_h * kernel_w
+                        
+                        if module.bias is not None:
+                            delta_W = delta_params[:weight_size].view(out_channels, flat_weight_dim)
+                            delta_b = delta_params[weight_size:].view(out_channels, 1)
+                            delta_W_full = torch.cat([delta_W, delta_b], dim=1)
+                        else:
+                            delta_W_full = delta_params.view(out_channels, flat_weight_dim)
+                    
+                    # Apply K-FAC formula: Tr(G * delta_W.T * A * delta_W)
+                    A = self.A_factors[layer_name]
+                    G = self.G_factors[layer_name]
+                    
+                    temp = torch.mm(torch.mm(delta_W_full.t(), G), delta_W_full)
                     penalty_layer = 0.5 * torch.sum(A * temp)
-                
-                total_penalty += penalty_layer
-                
-                # Clear intermediate tensors
-                del temp
-                if 'A_cpu' in locals():
-                    del A_cpu, temp_cpu
+                    total_penalty += penalty_layer
+                    
+                    # Clear intermediate tensors
+                    del temp
                 
         return total_penalty
 
-    def end_task(self, dataset):
-        """Memory-efficient end of task processing"""
-        # Initialize streaming computation
+    def begin_task(self, dataset):
+        """Initialize for new task - register hooks and reset running factors"""
+        # Reset running factors for new task
         self.A_running = {}
         self.G_running = {}
-        self.sample_count = 0
+        self.training_steps = 0
         
-        # Register hooks for streaming data collection
-        self._register_hooks()
-        
-        # Process data in smaller batches to avoid memory issues
-        self.net.eval()
-        with torch.enable_grad():
-            for j, data in enumerate(dataset.train_loader):
-                inputs, labels, _ = data
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+        # Register hooks for online updates
+        self._register_hooks_for_observe()
+    
+    def end_task(self, dataset):
+        """Finalize task - update global factors from running estimates"""
+        # Convert running factors to final factors with damping
+        for layer_name in self.A_running:
+            if layer_name in self.G_running:
+                # Add damping for numerical stability
+                A = self.A_running[layer_name].clone()
+                G = self.G_running[layer_name].clone()
                 
-                # Process in smaller mini-batches if needed
-                batch_size = inputs.size(0)
-                mini_batch_size = min(self.max_samples_per_batch, batch_size)
+                A.add_(torch.eye(A.size(0), device=A.device) * self.damping)
+                G.add_(torch.eye(G.size(0), device=G.device) * self.damping)
                 
-                for i in range(0, batch_size, mini_batch_size):
-                    mini_inputs = inputs[i:i+mini_batch_size]
-                    mini_labels = labels[i:i+mini_batch_size]
-                    
-                    self.opt.zero_grad()
-                    output = self.net(mini_inputs)
-                    
-                    # Compute loss for each sample
-                    for k, (ex_out, lab) in enumerate(zip(output, mini_labels)):
-                        loss = -F.nll_loss(self.logsoft(ex_out.unsqueeze(0)), lab.unsqueeze(0), reduction='none')
-                        exp_cond_prob = torch.mean(torch.exp(loss.detach().clone()))
-                        loss = torch.mean(loss) * exp_cond_prob
-                        loss.backward(retain_graph=k < len(mini_labels)-1)
-                        
-                        self.sample_count += 1
-                    
-                    # Clear GPU cache periodically
-                    if j % 10 == 0:
-                        torch.cuda.empty_cache()
-        
-        # Finalize Kronecker factors from streaming computation
-        new_A_factors, new_G_factors = self._finalize_kronecker_factors()
-        
-        # Update factors with online averaging
-        self._update_kronecker_factors(new_A_factors, new_G_factors)
+                # Update global factors with online averaging (like EWC_ON)
+                if layer_name not in self.A_factors:
+                    self.A_factors[layer_name] = A
+                    self.G_factors[layer_name] = G
+                else:
+                    self.A_factors[layer_name] = (self.args.gamma * self.A_factors[layer_name] + A)
+                    self.G_factors[layer_name] = (self.args.gamma * self.G_factors[layer_name] + G)
         
         # Store checkpoint parameters
         self.checkpoint = self.net.get_params().data.clone()
         
-        # Clean up
+        # Clean up hooks
         self._cleanup_hooks()
+        self.hooks_registered = False
+        
+        # Clear running factors to save memory
         self.A_running = {}
         self.G_running = {}
-        
-        # Final GPU cleanup
-        torch.cuda.empty_cache()
-        self.net.train()
 
     def observe(self, inputs, labels, not_aug_inputs):
         self.opt.zero_grad()
+        
+        # Forward pass - hooks will capture activations
         outputs = self.net(inputs)
+        
+        # Compute loss
+        main_loss = self.loss(outputs, labels)
         penalty = self.penalty()
         
         if self.CPRon:
-            loss = self.loss(outputs, labels) + self.args.e_lambda * penalty - self.beta * self.cpr(outputs)
+            loss = main_loss + self.args.e_lambda * penalty - self.beta * self.cpr(outputs)
         else:
-            loss = self.loss(outputs, labels) + self.args.e_lambda * penalty
+            loss = main_loss + self.args.e_lambda * penalty
             
         assert not torch.isnan(loss)
+        
+        # Backward pass - hooks will capture gradients
         loss.backward()
+        
+        # Update training step counter for hook frequency control
+        self.training_steps += 1
+        
         self.opt.step()
 
         return loss.item()
