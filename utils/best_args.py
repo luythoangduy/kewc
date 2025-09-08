@@ -182,7 +182,7 @@ best_args = {
                         'gamma': 1.0,
                         'batch_size': 128,
                         'n_epochs': 1}},
-        'kewc_on': {-1: {'lr': 0.01,
+        'kewc_on': {-1: {'lr': 0.001,
                         'e_lambda': 0.7,
                         'gamma': 1.0,
                         'batch_size': 128,

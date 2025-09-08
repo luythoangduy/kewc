@@ -58,6 +58,19 @@ class KEwcOn(ContinualModel):
     def _get_layer_name(self, module, name):
         """Generate unique layer name for indexing"""
         return f"{name}_{id(module)}"
+    
+    def _get_conv_patches_info(self, module, input_tensor):
+        """Helper function to compute patch information for Conv2d layers"""
+        # Calculate output dimensions
+        batch_size, in_channels, h_in, w_in = input_tensor.shape
+        kernel_h, kernel_w = module.kernel_size if isinstance(module.kernel_size, tuple) else (module.kernel_size, module.kernel_size)
+        padding_h, padding_w = module.padding if isinstance(module.padding, tuple) else (module.padding, module.padding)
+        stride_h, stride_w = module.stride if isinstance(module.stride, tuple) else (module.stride, module.stride)
+        
+        h_out = (h_in + 2 * padding_h - kernel_h) // stride_h + 1
+        w_out = (w_in + 2 * padding_w - kernel_w) // stride_w + 1
+        
+        return batch_size, in_channels, kernel_h, kernel_w, h_out, w_out
 
     def _register_hooks(self):
         """Register forward and backward hooks for collecting activations and gradients"""
@@ -76,6 +89,33 @@ class KEwcOn(ContinualModel):
                     if layer_name not in self.activations:
                         self.activations[layer_name] = []
                     self.activations[layer_name].append(act_with_bias)
+                
+                elif isinstance(module, nn.Conv2d):
+                    # For conv layers, use unfold to convert to matrix form
+                    act = input[0].detach()  # [batch, in_channels, H, W]
+                    
+                    # Use unfold to extract patches
+                    # patches: [batch, in_channels * kernel_h * kernel_w, num_patches]
+                    patches = F.unfold(
+                        act,
+                        kernel_size=module.kernel_size,
+                        padding=module.padding,
+                        stride=module.stride,
+                        dilation=module.dilation
+                    )
+                    
+                    # Reshape to [batch * num_patches, in_channels * kernel_h * kernel_w]
+                    batch_size, patch_dim, num_patches = patches.shape
+                    patches = patches.transpose(1, 2).contiguous().view(-1, patch_dim)
+                    
+                    # Add bias column for bias terms
+                    ones = torch.ones(patches.size(0), 1, device=patches.device)
+                    patches_with_bias = torch.cat([patches, ones], dim=1)
+                    
+                    if layer_name not in self.activations:
+                        self.activations[layer_name] = []
+                    self.activations[layer_name].append(patches_with_bias)
+                    
             return forward_hook
 
         def make_backward_hook(layer_name):
@@ -89,11 +129,24 @@ class KEwcOn(ContinualModel):
                     if layer_name not in self.gradients:
                         self.gradients[layer_name] = []
                     self.gradients[layer_name].append(grad)
+                
+                elif isinstance(module, nn.Conv2d) and grad_output[0] is not None:
+                    # For conv layers, flatten output gradients
+                    grad = grad_output[0].detach()  # [batch, out_channels, H_out, W_out]
+                    
+                    # Reshape to [batch * H_out * W_out, out_channels]
+                    batch_size, out_channels, h_out, w_out = grad.shape
+                    grad = grad.permute(0, 2, 3, 1).contiguous().view(-1, out_channels)
+                    
+                    if layer_name not in self.gradients:
+                        self.gradients[layer_name] = []
+                    self.gradients[layer_name].append(grad)
+                    
             return backward_hook
 
-        # Register hooks for all Linear layers
+        # Register hooks for all Linear and Conv2d layers
         for name, module in self.net.named_modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 layer_name = self._get_layer_name(module, name)
                 
                 fh = module.register_forward_hook(make_forward_hook(layer_name))
@@ -190,6 +243,37 @@ class KEwcOn(ContinualModel):
                 else:
                     current_params[layer_name] = current_layer_params_flat.view(module.out_features, module.in_features)
                     checkpoint_params[layer_name] = checkpoint_layer_params_flat.view(module.out_features, module.in_features)
+                
+                param_idx += total_size
+            
+            elif isinstance(module, nn.Conv2d):
+                layer_name = self._get_layer_name(module, name)
+                
+                # Get weight and bias parameters
+                weight_size = module.weight.numel()
+                bias_size = module.bias.numel() if module.bias is not None else 0
+                total_size = weight_size + bias_size
+                
+                # Extract current parameters
+                current_layer_params_flat = self.net.get_params()[param_idx:param_idx + total_size]
+                checkpoint_layer_params_flat = self.checkpoint[param_idx:param_idx + total_size]
+                
+                # Reshape conv weights from 4D to 2D matrix
+                # [out_channels, in_channels, kernel_h, kernel_w] -> [out_channels, in_channels * kernel_h * kernel_w]
+                out_channels, in_channels, kernel_h, kernel_w = module.weight.shape
+                flat_weight_dim = in_channels * kernel_h * kernel_w
+                
+                if module.bias is not None:
+                    current_W = current_layer_params_flat[:weight_size].view(out_channels, flat_weight_dim)
+                    current_b = current_layer_params_flat[weight_size:].view(out_channels, 1)
+                    current_params[layer_name] = torch.cat([current_W, current_b], dim=1)
+                    
+                    checkpoint_W = checkpoint_layer_params_flat[:weight_size].view(out_channels, flat_weight_dim)
+                    checkpoint_b = checkpoint_layer_params_flat[weight_size:].view(out_channels, 1)
+                    checkpoint_params[layer_name] = torch.cat([checkpoint_W, checkpoint_b], dim=1)
+                else:
+                    current_params[layer_name] = current_layer_params_flat.view(out_channels, flat_weight_dim)
+                    checkpoint_params[layer_name] = checkpoint_layer_params_flat.view(out_channels, flat_weight_dim)
                 
                 param_idx += total_size
         
