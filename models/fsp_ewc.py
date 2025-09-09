@@ -51,10 +51,10 @@ class FspEwc(ContinualModel):
         self.gamma = args.gamma
         
         # Online FSP penalty components
-        self.fsp_penalty = None  # Accumulated FSP penalty
-        self.checkpoint = None   # Parameters checkpoint
-        self.context_points = None  # Context points for FSP
-        self.kernel_matrix = None   # Precomputed kernel matrix
+        self.fsp_penalty = None   # Accumulated FSP penalty
+        self.checkpoint = None    # Parameters checkpoint
+        self.context_points = None   # Context points for FSP
+        self.kernel_matrix = None    # Precomputed kernel matrix
         self.task = 0
 
     def rbf_kernel(self, X1, X2):
@@ -68,7 +68,7 @@ class FspEwc(ContinualModel):
         
         # Tính khoảng cách Euclidean
         X1_norm = (X1**2).sum(dim=1, keepdim=True)  # (N1, 1)
-        X2_norm = (X2**2).sum(dim=1)                # (N2,)
+        X2_norm = (X2**2).sum(dim=1)               # (N2,)
         
         # Broadcasting để tính ||x1 - x2||^2
         dist_sq = X1_norm - 2 * torch.matmul(X1, X2.t()) + X2_norm
@@ -155,69 +155,69 @@ class FspEwc(ContinualModel):
 
     def end_task(self, dataset):
         """
-        Tính toán và tích lũy FSP penalty online sau khi hoàn thành task
+        Tính toán và tích lũy FSP penalty online sau khi hoàn thành task.
+        Sử dụng xấp xỉ Taylor để tránh tính nghịch đảo ma trận.
         """
-        # Thu thập context points từ dataset hiện tại (subsample để tiết kiệm memory)
-        context_inputs = []
-        context_outputs = []
-        max_samples = 100  # Giới hạn số samples để tránh memory overflow
-        
-        sample_count = 0
-        for data in dataset.train_loader:
-            if sample_count >= max_samples:
-                break
-            inputs, labels, _ = data
-            inputs = inputs.to(self.device)
-            
-            # Lấy outputs của model hiện tại
-            with torch.no_grad():
-                outputs = self.net(inputs)
-            
-            # Chỉ lấy một số samples từ batch
-            batch_samples = min(inputs.shape[0], max_samples - sample_count)
-            context_inputs.append(inputs[:batch_samples])
-            context_outputs.append(outputs[:batch_samples])
-            sample_count += batch_samples
-        
-        if len(context_inputs) > 0:
-            # Concatenate tất cả context points
-            new_context_points = torch.cat(context_inputs, dim=0)
-            new_context_outputs = torch.cat(context_outputs, dim=0)
-            
-            # Tính kernel matrix cho context points mới
-            num_context = new_context_points.shape[0]
-            if num_context > 0:
-                try:
-                    x_flat = new_context_points.view(num_context, -1)
-                    K = self.rbf_kernel(x_flat, x_flat)
-                    
-                    # Regularization
-                    epsilon = max(self.epsilon, 1e-4)
-                    identity = torch.eye(num_context).to(self.device)
-                    K_inv = torch.inverse(K + epsilon * identity)
-                    
-                    # Update context points và kernel matrix
-                    self.context_points = new_context_points
-                    self.kernel_matrix = K_inv
-                    
-                    # Update checkpoint với outputs hiện tại
-                    self.checkpoint = {
-                        'outputs': new_context_outputs.detach().clone()
-                    }
-                    
-                    # Tích lũy FSP penalty weight (giống gamma trong EWC-ON)
-                    if self.fsp_penalty is None:
-                        self.fsp_penalty = 1.0
-                    else:
-                        self.fsp_penalty = self.fsp_penalty * self.gamma + 1.0
-                        
-                except Exception as e:
-                    print(f"Error in FSP computation: {e}")
-        
-        # Cập nhật memory buffer
+        # Cập nhật memory buffer trước
         for data in dataset.train_loader:
             inputs, labels, _ = data
             inputs, labels = inputs.to(self.device), labels.to(self.device)
             self.memory_buffer.add_data(examples=inputs, labels=labels)
+        
+        # Thu thập context points từ buffer (sử dụng buffer sampling thay vì naive sampling)
+        max_samples = 100  # Giới hạn số samples để tránh memory overflow
+        
+        if not self.memory_buffer.is_empty():
+            # Sử dụng buffer sampling để lấy context points
+            buffer_size = min(max_samples, len(self.memory_buffer))
+            buffer_data = self.memory_buffer.get_data(buffer_size, transform=None)
+            context_inputs = buffer_data[0]  # Already a tensor
+            
+            # Lấy outputs của model hiện tại cho context points
+            with torch.no_grad():
+                context_outputs = self.net(context_inputs)
+        else:
+            return
+        
+        # Context points đã sẵn sàng từ buffer sampling
+        new_context_points = context_inputs
+        new_context_outputs = context_outputs
+        
+        # Tính kernel matrix cho context points mới
+        num_context = new_context_points.shape[0]
+        if num_context > 0:
+            try:
+                x_flat = new_context_points.view(num_context, -1)
+                K = self.rbf_kernel(x_flat, x_flat)
+                
+                # Regularization và xấp xỉ nghịch đảo bằng Taylor series
+                epsilon = max(self.epsilon, 1e-4)
+                identity = torch.eye(num_context).to(self.device)
+                
+                # --- BẮT ĐẦU THAY ĐỔI ---
+                # Dòng mã gốc:
+                # K_inv = torch.inverse(K + epsilon * identity)
+                
+                # Thay thế bằng xấp xỉ Taylor bậc nhất: (K + εI)^-1 ≈ (1/ε)I - (1/ε^2)K
+                K_inv = (1 / epsilon) * identity - (1 / (epsilon ** 2)) * K
+                # --- KẾT THÚC THAY ĐỔI ---
+                
+                # Update context points và kernel matrix
+                self.context_points = new_context_points
+                self.kernel_matrix = K_inv
+                
+                # Update checkpoint với outputs hiện tại
+                self.checkpoint = {
+                    'outputs': new_context_outputs.detach().clone()
+                }
+                
+                # Tích lũy FSP penalty weight (giống gamma trong EWC-ON)
+                if self.fsp_penalty is None:
+                    self.fsp_penalty = 1.0
+                else:
+                    self.fsp_penalty = self.fsp_penalty * self.gamma + 1.0
+                    
+            except Exception as e:
+                print(f"Error in FSP computation: {e}")
         
         self.task += 1
